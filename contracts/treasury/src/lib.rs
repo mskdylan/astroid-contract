@@ -61,6 +61,14 @@
 //! [`Error::TreasuryPaused`] code so off-chain monitors can distinguish "we
 //! paused on purpose" from a generic state failure.
 //!
+//! The breaker is deliberately temporary: it is stamped with the engagement
+//! ledger timestamp and lapses automatically once [`MAX_PAUSE_DURATION`] has
+//! elapsed, so a lost guardian key cannot strand an organization behind a
+//! paused treasury forever. Outflows resume on their own after the cap while
+//! the stale flag stays recorded until `unpause` clears it or `pause`
+//! re-engages over it; an indefinite stop must go through the multisig-only
+//! `freeze` instead.
+//!
 //! ## Multi-token accounting
 //!
 //! The treasury custodies any number of approved Soroban token contracts side
@@ -92,8 +100,8 @@
 
 use astroid_interfaces::{PolicyClient, TreasuryInterface, UpgradeableInterface};
 use astroid_shared::constants::{
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_LIFETIME_THRESHOLD,
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_PAYMENTS, MAX_PAUSE_DURATION,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
 };
 use astroid_shared::errors::Error;
 use astroid_shared::events;
@@ -132,6 +140,10 @@ pub struct Treasury {
     /// [`Error::TreasuryPaused`]; inbound deposits stay open so recovery
     /// funding can still arrive.
     pub paused: bool,
+    /// Ledger timestamp at which the breaker was engaged, or `0` while
+    /// disengaged. Every pause lapses automatically after
+    /// [`MAX_PAUSE_DURATION`]; see [`TreasuryContract::pause`].
+    pub paused_at: u64,
 }
 
 /// Per-asset accounting within the treasury.
@@ -252,6 +264,7 @@ impl TreasuryContract {
                 state: ResourceState::Active,
                 guardian: admin.clone(),
                 paused: false,
+                paused_at: 0,
             },
         );
         env.storage()
@@ -441,12 +454,21 @@ impl TreasuryContract {
     /// [`Error::TreasuryPaused`]; inbound deposits stay open so recovery
     /// funding can still arrive. Unlike [`Self::freeze`] this does not change
     /// any structural ownership or configuration - only the pause flag moves.
+    ///
+    /// The breaker is temporary by construction: it engages with the ledger
+    /// timestamp stamped into [`Treasury::paused_at`] and lapses automatically
+    /// once [`MAX_PAUSE_DURATION`] has elapsed, after which outflows resume on
+    /// their own while the stale flag stays recorded until it is cleared. An
+    /// indefinite stop must go through the multisig-only [`Self::freeze`].
     pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
         let mut t = Self::require_guardian(&env, &caller)?;
-        if t.paused {
+        // Re-engaging over a breaker that has merely lapsed is fine; only a
+        // pause still inside its window is rejected as a double-toggle.
+        if Self::pause_is_active(&t, &env) {
             return Err(Error::InvalidState);
         }
         t.paused = true;
+        t.paused_at = env.ledger().timestamp();
         Self::store(&env, &t);
         events::publish(
             &env,
@@ -465,13 +487,20 @@ impl TreasuryContract {
     ///
     /// Same guardian/multisig gate as [`Self::pause`], and symmetric: an
     /// attempt to unpause a treasury that is not paused fails with
-    /// [`Error::InvalidState`] rather than silently doing nothing.
+    /// [`Error::InvalidState`] rather than silently doing nothing. Clearing
+    /// the breaker also resets [`Treasury::paused_at`], so the next
+    /// [`Self::pause`] gets a fresh [`MAX_PAUSE_DURATION`] window.
+    ///
+    /// Releasing a breaker whose window has already lapsed also succeeds: the
+    /// stale flag and [`Treasury::paused_at`] are cleared so the breaker can
+    /// be re-engaged cleanly later.
     pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
         let mut t = Self::require_guardian(&env, &caller)?;
         if !t.paused {
             return Err(Error::InvalidState);
         }
         t.paused = false;
+        t.paused_at = 0;
         Self::store(&env, &t);
         events::publish(
             &env,
@@ -1165,8 +1194,23 @@ impl TreasuryContract {
     /// Reads the flag from instance storage on every call rather than caching
     /// it, and is never called on inbound paths: deposits must keep working
     /// during a pause so recovery funding can arrive.
+    ///
+    /// The breaker also lapses here: once [`MAX_PAUSE_DURATION`] has passed
+    /// since [`Treasury::paused_at`], a still-set flag no longer blocks
+    /// outflows. This bounds the blast radius of the breaker without trusting
+    /// any external keeper to release it — if the guardian disappears mid
+    /// incident, the treasury unblocks itself after the cap. A pause that
+    /// must outlive the cap is the multisig-only [`Self::freeze`].
+    /// Whether an engaged breaker is still inside its [`MAX_PAUSE_DURATION`]
+    /// window. A lapsed pause stops blocking outflows but keeps its stale
+    /// flag stored until [`Self::unpause`] clears it or [`Self::pause`]
+    /// re-engages over it.
+    fn pause_is_active(t: &Treasury, env: &Env) -> bool {
+        t.paused && env.ledger().timestamp() < t.paused_at.saturating_add(MAX_PAUSE_DURATION)
+    }
+
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::load(env).paused {
+        if Self::pause_is_active(&Self::load(env), env) {
             return Err(Error::TreasuryPaused);
         }
         Ok(())
@@ -1260,9 +1304,13 @@ impl TreasuryInterface for TreasuryContract {
         Self::is_asset_approved(&env, &asset)
     }
 
-    /// Whether the emergency circuit breaker is currently engaged.
+    /// Whether the emergency circuit breaker is currently engaged — that is,
+    /// a pause is stored *and* still inside its [`MAX_PAUSE_DURATION`] window.
+    /// A breaker left past its window reads `false` here even before the
+    /// stale flag is cleared, matching when outflows actually resume.
     fn is_paused(env: Env) -> bool {
-        Self::load(&env).paused
+        let t = Self::load(&env);
+        Self::pause_is_active(&t, &env)
     }
 }
 

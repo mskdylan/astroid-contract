@@ -6,7 +6,7 @@ use soroban_sdk::{
     token, vec, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
-use astroid_shared::constants::MAX_BATCH_PAYMENTS;
+use astroid_shared::constants::{MAX_BATCH_PAYMENTS, MAX_PAUSE_DURATION};
 use astroid_shared::errors::Error;
 use astroid_shared::types::Payment;
 
@@ -1229,4 +1229,122 @@ fn milestone_math_is_overflow_safe_at_i128_max() {
     h.client.release_next_milestone(&h.admin, &id);
     assert_eq!(token_balance(&h, &to), i128::MAX);
     assert_eq!(h.client.holding(&h.asset).total_in, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Pause window: MAX_PAUSE_DURATION auto-lapse (issue #297)
+// ---------------------------------------------------------------------------
+
+/// The breaker blocks outflows for exactly `MAX_PAUSE_DURATION` and then
+/// lapses on its own: outflows resume without any guardian action while the
+/// stale flag stays recorded.
+#[test]
+fn pause_lapses_after_max_duration_and_unblocks_outflows() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let recipient = Address::generate(&h.env);
+
+    h.client.pause(&h.admin);
+    assert!(h.client.is_paused());
+
+    // One second before the cap the breaker still blocks every outflow.
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp += MAX_PAUSE_DURATION - 1);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::TreasuryPaused)));
+    assert!(h.client.is_paused());
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
+
+    // At exactly MAX_PAUSE_DURATION the window closes: outflows resume on
+    // their own without any guardian action, while the stale flag stays
+    // recorded.
+    h.env.ledger().with_mut(|l| l.timestamp += 1);
+    assert!(!h.client.is_paused());
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 100);
+    assert_eq!(token_balance(&h, &h.client.address), 900);
+}
+
+#[test]
+fn lapsed_pause_keeps_inflows_open_and_is_permanently_harmless() {
+    let h = setup("vault", 1_500);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.pause(&h.admin);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp += MAX_PAUSE_DURATION);
+    assert!(!h.client.is_paused());
+
+    // The whole outflow surface is open again after the lapse.
+    let recipient = Address::generate(&h.env);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    let payments: Vec<Payment> = vec![&h.env, payment(&recipient, 50)];
+    h.client.batch_transfer(&h.admin, &h.asset, &payments);
+    assert_eq!(token_balance(&h, &recipient), 150);
+
+    // Deposits stay open across the pause and the lapse, as always.
+    h.client.deposit(&h.admin, &h.asset, &500);
+    assert_eq!(token_balance(&h, &h.client.address), 1_350);
+    // Internal books match: 1_500 in, 150 out.
+    let holding = h.client.holding(&h.asset);
+    assert_eq!(holding.total_in, 1_350);
+    assert_eq!(holding.total_out, 150);
+}
+
+#[test]
+fn lapsed_breaker_can_be_reengaged_with_a_fresh_window() {
+    let h = setup("vault", 0);
+
+    h.client.pause(&h.admin);
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp += MAX_PAUSE_DURATION);
+    assert!(!h.client.is_paused());
+
+    // The flag is stale, so the guardian can re-engage the breaker directly:
+    // the new pause opens a fresh full window without a separate unpause.
+    h.client.pause(&h.admin);
+    assert!(h.client.is_paused());
+    let recipient = Address::generate(&h.env);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &1);
+    assert_eq!(res, Err(Ok(Error::TreasuryPaused)));
+
+    // Near the end of the fresh window the breaker is still blocking.
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp += MAX_PAUSE_DURATION - 1);
+    assert!(h.client.is_paused());
+}
+
+#[test]
+fn unpause_still_fails_when_breaker_never_engaged() {
+    let h = setup("vault", 0);
+    // Long past any window could have started — the treasury was never
+    // paused, so the raw-flag guard keeps unpause rejected.
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp += MAX_PAUSE_DURATION + 1);
+    assert_eq!(h.client.try_unpause(&h.admin), Err(Ok(Error::InvalidState)));
+}
+
+#[test]
+fn active_pause_still_blocks_milestones_until_lapse() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let to = Address::generate(&h.env);
+    let mid = h
+        .client
+        .init_milestone_disbursement(&h.admin, &h.asset, &to, &1_000, &3);
+
+    h.client.pause(&h.admin);
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp += MAX_PAUSE_DURATION);
+    assert!(!h.client.is_paused());
+
+    // The milestone disbursement resumes as soon as the window closes.
+    h.client.release_next_milestone(&h.admin, &mid);
+    assert_eq!(token_balance(&h, &to), 333);
 }
