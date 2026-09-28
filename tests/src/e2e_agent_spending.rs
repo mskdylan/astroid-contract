@@ -21,6 +21,7 @@
 use astroid_budget::{BudgetContract, BudgetContractClient, Period};
 use astroid_escrow::{EscrowContract, EscrowContractClient, EscrowState};
 use astroid_policy::{PolicyContract, PolicyContractClient};
+use astroid_proposal::{ProposalContract, ProposalContractClient, ProposalState};
 use astroid_registry::{RegistryContract, RegistryContractClient};
 use astroid_shared::errors::Error;
 use astroid_shared::types::{AssetAmount, ModuleKind, ResourceState};
@@ -624,4 +625,79 @@ fn registry_links_the_deployed_modules() {
         assert_eq!(h.registry.lookup(&string(&h, ORG), &kind), addr);
     }
     assert!(h.registry.verify_owner(&string(&h, ORG), &h.org_owner));
+}
+
+// ---------------------------------------------------------------------------
+// Proposal timelock enforcement (issue #295)
+// ---------------------------------------------------------------------------
+
+/// The deployed proposal contract enforces its timelock end to end: a
+/// proposal that reaches the approval threshold may not be executed before
+/// `approved_at + timelock` (premature attempts fail with the protocol-wide
+/// [`Error::TimelockNotExpired`] code and change nothing), execution succeeds
+/// exactly at the release instant, and the executed state is observable
+/// through the contract's own views and the registry.
+#[test]
+fn proposal_timelock_gates_execution_end_to_end() {
+    let h = setup();
+
+    // The harness deployed the proposal contract and registered it in the
+    // registry; resolve it through the registry like a real integrator.
+    let proposal_id = h.registry.lookup(&string(&h, ORG), &ModuleKind::Proposal);
+    let proposal = ProposalContractClient::new(&h.env, &proposal_id);
+
+    // Configure a 100-second timelock (the contract is fresh in this env).
+    proposal.initialize(&100);
+    assert_eq!(h.env.ledger().timestamp(), START);
+
+    let proposer = h.org_owner.clone();
+    let approvers: Vec<Address> = vec![&h.env, h.admin.clone(), h.agent.clone(), proposer.clone()];
+    let pid = proposal.create(
+        &proposer,
+        &string(&h, ORG),
+        &string(&h, "wallet-1"),
+        &string(&h, "policy-1"),
+        &approvers,
+        &vec![&h.env],
+        &2,
+        &Vec::new(&h.env),
+        &(START + 30 * 86_400),
+        &0,
+    );
+
+    // Pending before any vote.
+    assert_eq!(proposal.state(&pid), ProposalState::Pending);
+
+    // One approval is not enough for the threshold of 2 — still pending.
+    proposal.approve(&h.admin, &pid);
+    assert_eq!(proposal.state(&pid), ProposalState::Pending);
+
+    // Reaching the threshold flips the state and stamps the timelock start.
+    proposal.approve(&h.agent, &pid);
+    assert_eq!(proposal.state(&pid), ProposalState::Approved);
+    assert!(!proposal.is_executed(&pid));
+    assert_eq!(proposal.get(&pid).approved_at, START);
+
+    // Executing immediately — long before the timelock releases — is refused
+    // with the deterministic code and leaves the proposal untouched.
+    let res = proposal.try_execute(&proposer, &pid);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(proposal.state(&pid), ProposalState::Approved);
+
+    // One second before the release instant the gate is still closed.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 99);
+    let res = proposal.try_execute(&proposer, &pid);
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+    assert_eq!(proposal.state(&pid), ProposalState::Approved);
+
+    // At exactly `approved_at + timelock` the gate opens: the `can_execute`
+    // view agrees with the entrypoint, and execution completes into the
+    // terminal executed state.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 100);
+    assert!(proposal.can_execute(&pid));
+    proposal.execute(&proposer, &pid);
+    assert_eq!(proposal.state(&pid), ProposalState::Executed);
+    assert!(proposal.is_executed(&pid));
+    // Execution is one-shot: the gate closes again behind the proposal.
+    assert!(!proposal.can_execute(&pid));
 }
